@@ -1,21 +1,31 @@
-#!/bin/bash
-# -----------------------------------------------------------
-# Quick launcher for ROS 2 Humble Docker container on Jetson
-# -----------------------------------------------------------
+# =============================================================
+# Custom ROS2 image for Jetson - extends Dusty’s base
+# =============================================================
+FROM dustynv/ros:humble-desktop-l4t-r36.4.0
 
-# Allow container GUI access
-xhost +local:root
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-lc"]
 
-# Run Docker container
-sudo docker run -it --rm \
-  --name humble-gui \
-  --network host \
-  --gpus all \
-  -e DISPLAY=$DISPLAY \
-  -e QT_X11_NO_MITSHM=1 \
-  -e NVIDIA_VISIBLE_DEVICES=all \
-  -e NVIDIA_DRIVER_CAPABILITIES=all,graphics,utility,video,compute \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  --privileged -v /dev:/dev \
-  -v ~/ros2_ws:/root/ros2_ws \
-  dustynv/ros:humble-desktop-l4t-r36.4.0
+# --- Install essential build tools (only if not already in base) ---
+RUN apt-get update && apt-get install -y \
+    python3-rosdep python3-vcstool python3-colcon-common-extensions \
+    git build-essential cmake \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- Initialize rosdep (safe even if already initialized) ---
+RUN rosdep init || true && rosdep update
+
+# --- Copy your ROS workspace into the image ---
+WORKDIR /root/ros2_ws
+COPY src/ src/
+
+# --- Install dependencies & build (automated) ---
+RUN rosdep install --from-paths src --rosdistro humble -y --ignore-src && \
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# --- Auto-source the workspace on startup ---
+RUN echo 'source /opt/ros/humble/setup.bash' >> /root/.bashrc && \
+    echo 'if [ -f /root/ros2_ws/install/setup.bash ]; then source /root/ros2_ws/install/setup.bash; fi' >> /root/.bashrc
+
+CMD ["/bin/bash"]
+
