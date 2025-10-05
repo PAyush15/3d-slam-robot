@@ -6,6 +6,14 @@ FROM dustynv/ros:humble-desktop-l4t-r36.4.0
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-lc"]
 
+# Refresh expired Ubuntu & ROS keys (non-interactive, modern method)
+RUN apt-get update && apt-get install -y curl gnupg2 ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+    | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu jammy main" \
+    > /etc/apt/sources.list.d/ros2.list
+
 # --- Install essential build tools (only if not already in base) ---
 RUN apt-get update && apt-get install -y \
     python3-rosdep python3-vcstool python3-colcon-common-extensions \
