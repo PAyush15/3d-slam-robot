@@ -1,0 +1,21 @@
+#!/bin/bash
+# -----------------------------------------------------------
+# Quick launcher for ROS 2 Humble Docker container on Jetson
+# -----------------------------------------------------------
+
+# Allow container GUI access
+xhost +local:root
+
+# Run Docker container
+sudo docker run -it --rm \
+  --name humble-gui \
+  --network host \
+  --gpus all \
+  -e DISPLAY=$DISPLAY \
+  -e QT_X11_NO_MITSHM=1 \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  -e NVIDIA_DRIVER_CAPABILITIES=all,graphics,utility,video,compute \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  --privileged -v /dev:/dev \
+  -v ~/ros2_ws:/root/ros2_ws \
+  dustynv/ros:humble-desktop-l4t-r36.4.0
