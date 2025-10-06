@@ -80,14 +80,14 @@ class Bridge(Node):
                 children = await objects.get_children()
                 names = []
                 for ch in children:
-                    bn = await ch.get_browse_name()
+                    bn = await ch.read_browse_name()
                     names.append((bn.Name, _nodeid_str(ch)))
                 self.get_logger().info(f"Objects children: {names}")
 
                 # Find App child by name (case-insensitive)
                 app_node = None
                 for ch in children:
-                    bn = await ch.get_browse_name()
+                    bn = await ch.read_browse_name()
                     if bn.Name.lower() == "app":
                         app_node = ch
                         break
@@ -100,7 +100,7 @@ class Bridge(Node):
                 # List App children and map them
                 app_children = await app_node.get_children()
                 for c in app_children:
-                    bn = await c.get_browse_name()
+                    bn = await c.read_browse_name()
                     bname = bn.Name
                     self.nodes[bname] = c
                     self.nodeid_to_name[c.nodeid.to_string()] = bname
