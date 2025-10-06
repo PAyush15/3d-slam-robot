@@ -58,6 +58,16 @@ class Bridge(Node):
         except Exception as e:
             self.get_logger().error(f"Failed writing to {node}: {e}")
 
+    
+    async def write_typed(node, value, vartype):
+    """ node: asyncua node, vartype: ua.VariantType e.g. ua.VariantType.Boolean """
+    try:
+        variant = ua.Variant(value, vartype)
+        await node.write_value(variant)
+    except Exception as e:
+        print("write_typed error:", e)
+
+    
     async def find_app_and_nodes(self):
         """
         Browse objects and find 'App' by browse name, then find child vars.
