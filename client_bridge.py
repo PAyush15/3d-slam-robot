@@ -1,182 +1,180 @@
 #!/usr/bin/env python3
-import asyncio, os, threading, time
+# client_bridge.py
+import os
+import asyncio
+import threading
+import time
 from asyncua import Client, ua
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import UInt16, String, Bool
-from geometry_msgs.msg import PoseStamped
 
-SERVER_URL = os.environ.get("OPCUA_URL", "opc.tcp://192.168.97.228:4840/freeopcua/server/")
+OPCUA_URL = os.environ.get("OPCUA_URL", "opc.tcp://192.168.97.228:4840/freeopcua/server/")
 
-class Bridge(Node):
+# Try to import rclpy; if not present we fallback to printing
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import UInt16, String
+    from geometry_msgs.msg import PoseStamped
+    HAS_ROS = True
+except Exception:
+    HAS_ROS = False
+    # Create a minimal Node-like stand-in for logging if ROS not available
+    class DummyNode:
+        def __init__(self, name):
+            self.name = name
+        def get_logger(self):
+            class L:
+                @staticmethod
+                def info(m): print("[INFO]", m)
+                @staticmethod
+                def warning(m): print("[WARN]", m)
+                @staticmethod
+                def error(m): print("[ERR]", m)
+            return L()
+    Node = DummyNode
+
+class OpcuaBridge(Node):
     def __init__(self):
-        super().__init__("opcua_bridge")
-        self.state_pub  = self.create_publisher(String, "/plc/state", 10)
-        self.fault_pub  = self.create_publisher(UInt16, "/plc/faults", 10)
+        Node.__init__(self, "opcua_bridge") if HAS_ROS else Node("opcua_bridge")
+        if HAS_ROS:
+            self.state_pub = self.create_publisher(String, "/plc/state", 10)
+            self.fault_pub = self.create_publisher(UInt16, "/plc/faults", 10)
+            self.mission_sub = self.create_subscription(UInt16, "/cmd/mission", self.on_mission, 10)
+            self.goal_sub = self.create_subscription(PoseStamped, "/cmd/goal_pose", self.on_goal, 10)
+        else:
+            self.get_logger().info("ROS2 not available; running in fallback print mode.")
 
-        self.mission_sub = self.create_subscription(UInt16, "/cmd/mission", self.on_mission, 10)
-        self.goal_sub    = self.create_subscription(PoseStamped, "/cmd/goal_pose", self.on_goal, 10)
-
-        self.hb = False
-        self.create_timer(0.2, self.on_heartbeat)  # heartbeat publishes every 200 ms
-
-        self.client = Client(SERVER_URL)
+        self.client = Client(OPCUA_URL)
         self.loop = asyncio.get_event_loop()
-        self.nodes = {}              # friendly name -> node object
-        self.nodeid_to_name = {}     # nodeid string -> friendly name
+        self.nodes = {}            # friendly name -> Node
+        self.nodeid_to_name = {}   # nodeid string -> friendly name
+        self.hb = False
 
-    def on_mission(self, msg: UInt16):
+        # heartbeat timer (200ms)
+        if HAS_ROS:
+            self.create_timer(0.2, self.toggle_heartbeat)
+        else:
+            # fallback simple timer using thread loop
+            pass
+
+    def on_mission(self, msg):
         if "MissionId" in self.nodes:
-            self.loop.create_task(self.safe_write(self.nodes["MissionId"], ua.UInt16(msg.data)))
+            self.loop.create_task(self.write_typed(self.nodes["MissionId"], int(msg.data), ua.VariantType.UInt16))
         else:
-            self.get_logger().warning("MissionId node not resolved yet; ignoring mission cmd")
+            self.get_logger().warning("MissionId not resolved. Ignoring mission msg.")
 
-    def on_goal(self, msg: PoseStamped):
+    def on_goal(self, msg):
         if all(k in self.nodes for k in ("GoalX","GoalY","GoalTheta")):
-            self.loop.create_task(self.safe_write(self.nodes["GoalX"], ua.Double(msg.pose.position.x)))
-            self.loop.create_task(self.safe_write(self.nodes["GoalY"], ua.Double(msg.pose.position.y)))
-            # convert quaternion to yaw properly in production
-            self.loop.create_task(self.safe_write(self.nodes["GoalTheta"], ua.Double(0.0)))
+            x = float(msg.pose.position.x)
+            y = float(msg.pose.position.y)
+            # For demo: use 0.0 for theta; compute real yaw if needed
+            self.loop.create_task(self.write_typed(self.nodes["GoalX"], x, ua.VariantType.Double))
+            self.loop.create_task(self.write_typed(self.nodes["GoalY"], y, ua.VariantType.Double))
+            self.loop.create_task(self.write_typed(self.nodes["GoalTheta"], 0.0, ua.VariantType.Double))
         else:
-            self.get_logger().warning("Goal nodes not resolved yet; ignoring goal_pose")
+            self.get_logger().warning("Goal nodes not resolved. Ignoring goal_pose.")
 
-    def on_heartbeat(self):
-        # only try to write if we resolved the node
+    def toggle_heartbeat(self):
+        # called by ROS timer. If ROS not present, we'll toggle from async run
+        self.hb = not self.hb
         if "Heartbeat" in self.nodes:
-            self.hb = not self.hb
-            self.loop.create_task(self.safe_write(self.nodes["Heartbeat"], ua.Boolean(self.hb)))
+            self.loop.create_task(self.write_typed(self.nodes["Heartbeat"], bool(self.hb), ua.VariantType.Boolean))
         else:
-            # keep toggling locally but do not attempt write
-            self.hb = not self.hb
-            # Log only occasionally to avoid spam
+            # log occasionally
             if int(time.time()) % 5 == 0:
-                self.get_logger().warning("Heartbeat node not available yet; not writing")
+                self.get_logger().warning("Heartbeat node not resolved yet.")
 
-    async def safe_write(self, node, val):
+    async def write_typed(self, node, value, vartype):
         try:
-            await node.write_value(val)
+            await node.write_value(ua.Variant(value, vartype))
         except Exception as e:
-            self.get_logger().error(f"Failed writing to {node}: {e}")
+            self.get_logger().error(f"Failed to write {node}: {e}")
 
-    
-    async def write_typed(node, value, vartype):
-    """ node: asyncua node, vartype: ua.VariantType e.g. ua.VariantType.Boolean """
-    try:
-        variant = ua.Variant(value, vartype)
-        await node.write_value(variant)
-    except Exception as e:
-        print("write_typed error:", e)
-
-    
-    async def find_app_and_nodes(self):
-        """
-        Browse objects and find 'App' by browse name, then find child vars.
-        Retry for a short time if not present yet.
-        """
-        objects = self.client.nodes.objects
-
-        def _nodeid_str(node):
+    async def discover_nodes(self, timeout_s=10.0):
+        """ Browse Objects and populate self.nodes mapping. Retry for timeout_s seconds. """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
             try:
-                return node.nodeid.to_string()
-            except:
-                return str(node)
-
-        for attempt in range(20):   # ~10 seconds at 0.5s sleep
-            try:
-                # Print namespaces
-                nsarr = await self.client.get_namespace_array()
-                self.get_logger().info(f"Namespaces: {nsarr}")
-
-                children = await objects.get_children()
-                names = []
+                ns = await self.client.get_namespace_array()
+                self.get_logger().info(f"Namespaces: {ns}")
+                children = await self.client.nodes.objects.get_children()
+                # print top children
+                top = []
                 for ch in children:
-                    bn = await ch.read_browse_name()
-                    names.append((bn.Name, _nodeid_str(ch)))
-                self.get_logger().info(f"Objects children: {names}")
+                    try:
+                        bn = await ch.read_browse_name()
+                        top.append((bn.Name, ch.nodeid.to_string()))
+                    except Exception:
+                        top.append(("<?>", ch.nodeid.to_string()))
+                self.get_logger().info(f"Top-level Objects: {top}")
 
-                # Find App child by name (case-insensitive)
+                # find App
                 app_node = None
                 for ch in children:
-                    bn = await ch.read_browse_name()
-                    if bn.Name.lower() == "app":
-                        app_node = ch
-                        break
+                    try:
+                        bn = await ch.read_browse_name()
+                        if bn.Name.lower() == "app":
+                            app_node = ch
+                            break
+                    except Exception:
+                        continue
 
-                if app_node is None:
-                    self.get_logger().warning("No 'App' object found yet on server; retrying...")
+                if not app_node:
+                    self.get_logger().warning("App node not found yet; retrying...")
                     await asyncio.sleep(0.5)
                     continue
 
-                # List App children and map them
+                # enumerate app children
                 app_children = await app_node.get_children()
                 for c in app_children:
-                    bn = await c.read_browse_name()
-                    bname = bn.Name
-                    self.nodes[bname] = c
-                    self.nodeid_to_name[c.nodeid.to_string()] = bname
                     try:
-                        val = await c.read_value()
-                    except Exception:
-                        val = "<no-read>"
-                    self.get_logger().info(f"Resolved node: {bname} = {val} (nodeid: {c.nodeid.to_string()})")
+                        bn = await c.read_browse_name()
+                        name = bn.Name
+                        self.nodes[name] = c
+                        self.nodeid_to_name[c.nodeid.to_string()] = name
+                        try:
+                            val = await c.read_value()
+                        except Exception:
+                            val = "<no-read>"
+                        self.get_logger().info(f"Resolved {name} = {val} (nodeid={c.nodeid.to_string()})")
+                    except Exception as e:
+                        self.get_logger().warning(f"Could not read child: {e}")
 
-                # We found App and its children — break
                 return True
-
             except Exception as e:
-                self.get_logger().warning(f"Error during browse attempt {attempt}: {e}")
+                self.get_logger().warning(f"Discovery error: {e}; retrying...")
                 await asyncio.sleep(0.5)
-
         return False
 
     async def run_async(self):
-        # connect
-        await self.client.connect()
-        self.get_logger().info(f"Connected to OPC UA server @ {SERVER_URL}")
+        try:
+            await self.client.connect()
+            self.get_logger().info(f"Connected to OPC UA server @ {OPCUA_URL}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to connect: {e}")
+            return
 
-        ok = await self.find_app_and_nodes()
+        ok = await self.discover_nodes(timeout_s=10.0)
         if not ok:
-            self.get_logger().error("Could not resolve App and its variables on the server after retries.")
-            # still set up subscriptions for anything we have resolved
-        # set up subscriptions for known nodes (RobotBusy, FaultCode)
-        # build a map of node objects to friendly names for use in handler
-        sub = await self.client.create_subscription(200, SubHandler(self))
-        # subscribe what we can
-        for name in ("RobotBusy", "FaultCode"):
+            self.get_logger().warning("Could not resolve App children in time; proceeding with what we have.")
+
+        # subscribe to RobotBusy and FaultCode if present
+        handler = SubHandler(self)
+        sub = await self.client.create_subscription(200, handler)
+        for name in ("RobotBusy","FaultCode"):
             if name in self.nodes:
                 await sub.subscribe_data_change(self.nodes[name])
                 self.get_logger().info(f"Subscribed to {name}")
             else:
-                self.get_logger().warning(f"{name} not available to subscribe")
+                self.get_logger().warning(f"{name} not present; cannot subscribe")
 
-        # keep running while rclpy is alive
-        while rclpy.ok():
-            await asyncio.sleep(0.1)
+        # If ROS not available, create our own heartbeat loop:
+        if not HAS_ROS:
+            async def hb_loop():
+                while True:
+                    self.hb = not self.hb
+                    if "Heartbeat" in self.nodes:
+                        await self.write_typed(self.nodes["Heartbeat"], bool(self.hb), ua.VariantType.Boolean)
+                    await asyncio.sleep(0.2)
+            asyncio.create_task(hb_loop())
 
-class SubHandler:
-    def __init__(self, bridge: Bridge):
-        self.bridge = bridge
-
-    def datachange_notification(self, node, val, data):
-        nid = node.nodeid.to_string()
-        name = self.bridge.nodeid_to_name.get(nid, nid)
-        if name == "RobotBusy":
-            self.bridge.state_pub.publish(String(data="BUSY" if val else "IDLE"))
-        elif name == "FaultCode":
-            try:
-                self.bridge.fault_pub.publish(UInt16(data=int(val)))
-            except Exception:
-                self.bridge.get_logger().error("FaultCode publish error")
-
-def main():
-    rclpy.init()
-    bridge = Bridge()
-    t = threading.Thread(target=lambda: asyncio.run(bridge.run_async()), daemon=True)
-    t.start()
-    try:
-        rclpy.spin(bridge)
-    finally:
-        rclpy.shutdown()
-
-if __name__ == "__main__":
-    main()
+        # keep alive until rclpy shutdown or pr
