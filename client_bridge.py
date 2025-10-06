@@ -177,4 +177,56 @@ class OpcuaBridge(Node):
                     await asyncio.sleep(0.2)
             asyncio.create_task(hb_loop())
 
-        # keep alive until rclpy shutdown or pr
+        # keep alive until rclpy shutdown or program exit
+        try:
+            while True:
+                await asyncio.sleep(0.1)
+        finally:
+            await sub.delete()
+
+class SubHandler:
+    def __init__(self, bridge):
+        self.bridge = bridge
+    def datachange_notification(self, node, val, data):
+        nid = node.nodeid.to_string()
+        name = self.bridge.nodeid_to_name.get(nid, nid)
+        if name == "RobotBusy":
+            if HAS_ROS:
+                msg = String()
+                msg.data = "BUSY" if val else "IDLE"
+                self.bridge.state_pub.publish(msg)
+            else:
+                self.bridge.get_logger().info(f"RobotBusy = {val}")
+        elif name == "FaultCode":
+            if HAS_ROS:
+                m = UInt16()
+                m.data = int(val)
+                self.bridge.fault_pub.publish(m)
+            else:
+                self.bridge.get_logger().info(f"FaultCode = {val}")
+
+def main():
+    if HAS_ROS:
+        rclpy.init()
+        node = OpcuaBridge()
+    else:
+        node = OpcuaBridge()
+
+    t = threading.Thread(target=lambda: asyncio.run(node.run_async()), daemon=True)
+    t.start()
+
+    if HAS_ROS:
+        try:
+            rclpy.spin(node)
+        finally:
+            rclpy.shutdown()
+    else:
+        # fallback: keep main thread alive while asyncio runs in background
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Exiting")
+
+if __name__ == "__main__":
+    main()
