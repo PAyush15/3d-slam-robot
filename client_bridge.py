@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# client_bridge.py
+# client_bridge.py  -- robust bridge that correctly schedules writes from ROS callbacks
 import os
 import asyncio
 import threading
@@ -17,19 +17,18 @@ try:
     HAS_ROS = True
 except Exception:
     HAS_ROS = False
-    # Create a minimal Node-like stand-in for logging if ROS not available
+    class DummyLogger:
+        @staticmethod
+        def info(m): print("[INFO]", m)
+        @staticmethod
+        def warning(m): print("[WARN]", m)
+        @staticmethod
+        def error(m): print("[ERR]", m)
     class DummyNode:
-        def __init__(self, name):
-            self.name = name
-        def get_logger(self):
-            class L:
-                @staticmethod
-                def info(m): print("[INFO]", m)
-                @staticmethod
-                def warning(m): print("[WARN]", m)
-                @staticmethod
-                def error(m): print("[ERR]", m)
-            return L()
+        def __init__(self, name): self._log = DummyLogger()
+        def get_logger(self): return self._log
+        # minimal stubs for methods used elsewhere
+        def create_timer(self, *_): pass
     Node = DummyNode
 
 class OpcuaBridge(Node):
@@ -44,60 +43,78 @@ class OpcuaBridge(Node):
             self.get_logger().info("ROS2 not available; running in fallback print mode.")
 
         self.client = Client(OPCUA_URL)
-        self.loop = asyncio.get_event_loop()
+        # async_loop will be set to the running asyncio loop inside run_async()
+        self.async_loop = None
+
         self.nodes = {}            # friendly name -> Node
         self.nodeid_to_name = {}   # nodeid string -> friendly name
         self.hb = False
 
-        # heartbeat timer (200ms)
+        # heartbeat call (if ROS present we use its timer)
         if HAS_ROS:
             self.create_timer(0.2, self.toggle_heartbeat)
-        else:
-            # fallback simple timer using thread loop
-            pass
 
+    # ---- ROS callbacks ----
     def on_mission(self, msg):
-        if "MissionId" in self.nodes:
-            self.loop.create_task(self.write_typed(self.nodes["MissionId"], int(msg.data), ua.VariantType.UInt16))
-        else:
-            self.get_logger().warning("MissionId not resolved. Ignoring mission msg.")
+        # called in ROS thread (main thread). Schedule UA write safely into UA asyncio loop.
+        self.get_logger().info(f"Received ROS /cmd/mission -> {getattr(msg,'data',None)}")
+        if "MissionId" not in self.nodes:
+            self.get_logger().warning("MissionId node not resolved; cannot write mission.")
+            return
+        try:
+            # schedule the coroutine thread-safely into the UA loop
+            coro = self.write_typed(self.nodes["MissionId"], int(msg.data), ua.VariantType.UInt16)
+            if self.async_loop is None:
+                self.get_logger().error("Async loop not set yet; cannot schedule write.")
+            else:
+                asyncio.run_coroutine_threadsafe(coro, self.async_loop)
+                self.get_logger().info("Scheduled write to MissionId")
+        except Exception as e:
+            self.get_logger().error(f"Exception scheduling Mission write: {e}")
 
     def on_goal(self, msg):
-        if all(k in self.nodes for k in ("GoalX","GoalY","GoalTheta")):
-            x = float(msg.pose.position.x)
-            y = float(msg.pose.position.y)
-            # For demo: use 0.0 for theta; compute real yaw if needed
-            self.loop.create_task(self.write_typed(self.nodes["GoalX"], x, ua.VariantType.Double))
-            self.loop.create_task(self.write_typed(self.nodes["GoalY"], y, ua.VariantType.Double))
-            self.loop.create_task(self.write_typed(self.nodes["GoalTheta"], 0.0, ua.VariantType.Double))
+        self.get_logger().info("Received ROS /cmd/goal_pose")
+        if not all(k in self.nodes for k in ("GoalX","GoalY","GoalTheta")):
+            self.get_logger().warning("Goal nodes not resolved; ignoring goal")
+            return
+        # compute pose values
+        x = float(msg.pose.position.x)
+        y = float(msg.pose.position.y)
+        theta = 0.0
+        # schedule writes
+        if self.async_loop:
+            asyncio.run_coroutine_threadsafe(self.write_typed(self.nodes["GoalX"], x, ua.VariantType.Double), self.async_loop)
+            asyncio.run_coroutine_threadsafe(self.write_typed(self.nodes["GoalY"], y, ua.VariantType.Double), self.async_loop)
+            asyncio.run_coroutine_threadsafe(self.write_typed(self.nodes["GoalTheta"], theta, ua.VariantType.Double), self.async_loop)
+            self.get_logger().info(f"Scheduled goal write x={x} y={y} th={theta}")
         else:
-            self.get_logger().warning("Goal nodes not resolved. Ignoring goal_pose.")
+            self.get_logger().error("Async loop not set; cannot write goal")
 
     def toggle_heartbeat(self):
-        # called by ROS timer. If ROS not present, we'll toggle from async run
         self.hb = not self.hb
-        if "Heartbeat" in self.nodes:
-            self.loop.create_task(self.write_typed(self.nodes["Heartbeat"], bool(self.hb), ua.VariantType.Boolean))
+        if "Heartbeat" in self.nodes and self.async_loop:
+            asyncio.run_coroutine_threadsafe(self.write_typed(self.nodes["Heartbeat"], bool(self.hb), ua.VariantType.Boolean), self.async_loop)
         else:
-            # log occasionally
+            # occasional log if heartbeat node missing
             if int(time.time()) % 5 == 0:
-                self.get_logger().warning("Heartbeat node not resolved yet.")
+                self.get_logger().warning("Heartbeat node not resolved (toggle_heartbeat)")
 
+    # ---- OPC UA helpers ----
     async def write_typed(self, node, value, vartype):
         try:
             await node.write_value(ua.Variant(value, vartype))
+            self.get_logger().info(f"Wrote {value} as {vartype.name} to node {self.nodeid_to_name.get(node.nodeid.to_string(), node.nodeid.to_string())}")
         except Exception as e:
-            self.get_logger().error(f"Failed to write {node}: {e}")
+            self.get_logger().error(f"Failed to write node {node}: {e}")
 
     async def discover_nodes(self, timeout_s=10.0):
-        """ Browse Objects and populate self.nodes mapping. Retry for timeout_s seconds. """
+        """ Browse Objects and populate self.nodes mapping. """
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             try:
                 ns = await self.client.get_namespace_array()
                 self.get_logger().info(f"Namespaces: {ns}")
                 children = await self.client.nodes.objects.get_children()
-                # print top children
                 top = []
                 for ch in children:
                     try:
@@ -107,7 +124,6 @@ class OpcuaBridge(Node):
                         top.append(("<?>", ch.nodeid.to_string()))
                 self.get_logger().info(f"Top-level Objects: {top}")
 
-                # find App
                 app_node = None
                 for ch in children:
                     try:
@@ -119,11 +135,10 @@ class OpcuaBridge(Node):
                         continue
 
                 if not app_node:
-                    self.get_logger().warning("App node not found yet; retrying...")
+                    self.get_logger().warning("App node not found; retrying...")
                     await asyncio.sleep(0.5)
                     continue
 
-                # enumerate app children
                 app_children = await app_node.get_children()
                 for c in app_children:
                     try:
@@ -146,12 +161,17 @@ class OpcuaBridge(Node):
         return False
 
     async def run_async(self):
+        """ This runs inside the asyncio thread. We capture the running loop here. """
         try:
             await self.client.connect()
             self.get_logger().info(f"Connected to OPC UA server @ {OPCUA_URL}")
         except Exception as e:
             self.get_logger().error(f"Failed to connect: {e}")
             return
+
+        # capture the running loop so other threads can schedule coroutines into it
+        self.async_loop = asyncio.get_running_loop()
+        self.get_logger().info("Captured asyncio loop for scheduling.")
 
         ok = await self.discover_nodes(timeout_s=10.0)
         if not ok:
@@ -167,7 +187,7 @@ class OpcuaBridge(Node):
             else:
                 self.get_logger().warning(f"{name} not present; cannot subscribe")
 
-        # If ROS not available, create our own heartbeat loop:
+        # If ROS not available, start a heartbeat loop here
         if not HAS_ROS:
             async def hb_loop():
                 while True:
@@ -177,7 +197,6 @@ class OpcuaBridge(Node):
                     await asyncio.sleep(0.2)
             asyncio.create_task(hb_loop())
 
-        # keep alive until rclpy shutdown or program exit
         try:
             while True:
                 await asyncio.sleep(0.1)
@@ -221,7 +240,6 @@ def main():
         finally:
             rclpy.shutdown()
     else:
-        # fallback: keep main thread alive while asyncio runs in background
         try:
             while True:
                 time.sleep(1)
